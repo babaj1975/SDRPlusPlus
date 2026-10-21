@@ -10,6 +10,9 @@
 #include <utils/optionlist.h>
 #include <algorithm>
 #include <regex>
+#include <atomic>
+#include <mutex>
+#include "../../sweep/sweep_controller.h"
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -33,6 +36,10 @@ class PlutoSDRSourceModule : public ModuleManager::Instance {
 public:
     PlutoSDRSourceModule(std::string name) {
         this->name = name;
+
+        config.acquire();
+        if (config.conf.contains("sweep")) { sweep.load(config.conf["sweep"]); }
+        config.release();
 
         // Define valid samplerates
         for (int sr = 1000000; sr <= 61440000; sr += 500000) {
@@ -280,6 +287,13 @@ private:
         // If no device is selected, give up
         if (_this->devDesc.empty() || _this->uri.empty()) { return; }
 
+        const int blockSize = _this->samplerate / 200;
+        const int rfBandwidth = _this->bandwidth > 0 ? _this->bandwidth : (std::min)(_this->samplerate, 52000000);
+        if (!_this->sweep.begin(_this->samplerate, rfBandwidth, blockSize, core::args["server"].b())) {
+            flog::error("Invalid PlutoSDR sweep settings");
+            return;
+        }
+
         // Open context
         _this->ctx = iio_create_context_from_uri(_this->uri.c_str());
         if (_this->ctx == NULL) {
@@ -292,18 +306,35 @@ private:
         if (_this->phy == NULL) {
             flog::error("Could not connect to pluto phy");
             iio_context_destroy(_this->ctx);
+            _this->ctx = NULL;
             return;
         }
         _this->dev = iio_context_find_device(_this->ctx, "cf-ad9361-lpc");
         if (_this->dev == NULL) {
             flog::error("Could not connect to pluto dev");
             iio_context_destroy(_this->ctx);
+            _this->ctx = NULL;
             return;
         }
 
         // Get RX channels
         _this->rxChan = iio_device_find_channel(_this->phy, "voltage0", false);
         _this->rxLO = iio_device_find_channel(_this->phy, "altvoltage0", true);
+        if (!_this->rxChan || !_this->rxLO) {
+            flog::error("Could not acquire PlutoSDR control channels");
+            iio_context_destroy(_this->ctx);
+            _this->ctx = NULL;
+            return;
+        }
+
+        // Bound blocking refills and the amount of old IQ queued at a retune.
+        iio_context_set_timeout(_this->ctx, 2000);
+        if (_this->sweep.active() && iio_device_set_kernel_buffers_count(_this->dev, 2) < 0) {
+            _this->sweep.fail("Could not configure the RX buffer queue.");
+            iio_context_destroy(_this->ctx);
+            _this->ctx = NULL;
+            return;
+        }
 
         // Enable RX LO and disable TX
         iio_channel_attr_write_bool(iio_device_find_channel(_this->phy, "altvoltage1", true), "powerdown", true);
@@ -319,7 +350,19 @@ private:
         _this->setBandwidth(_this->bandwidth);
         
         // Configure the ADC filters
-        ad9361_set_bb_rate(_this->phy, round(_this->samplerate));
+        const int rateResult = ad9361_set_bb_rate(_this->phy, round(_this->samplerate));
+        if (_this->sweep.active()) {
+            long long actualRate = 0, actualBandwidth = 0;
+            if (rateResult < 0 ||
+                iio_channel_attr_read_longlong(_this->rxChan, "sampling_frequency", &actualRate) < 0 ||
+                iio_channel_attr_read_longlong(_this->rxChan, "rf_bandwidth", &actualBandwidth) < 0 ||
+                !_this->sweep.begin(actualRate, actualBandwidth, blockSize, false)) {
+                _this->sweep.fail("Could not configure or read back the RX sample rate/bandwidth.");
+                iio_context_destroy(_this->ctx);
+                _this->ctx = NULL;
+                return;
+            }
+        }
 
         // Start worker thread
         _this->running = true;
@@ -334,6 +377,10 @@ private:
         // Stop worker thread
         _this->running = false;
         _this->stream.stopWriter();
+        {
+            std::lock_guard<std::mutex> lock(_this->rxBufferMutex);
+            if (_this->rxBuffer) { iio_buffer_cancel(_this->rxBuffer); }
+        }
         _this->workerThread.join();
         _this->stream.clearWriteStop();
 
@@ -349,7 +396,7 @@ private:
     static void tune(double freq, void* ctx) {
         PlutoSDRSourceModule* _this = (PlutoSDRSourceModule*)ctx;
         _this->freq = freq;
-        if (_this->running) {
+        if (_this->running && !_this->sweep.active()) {
             // Tune device
             iio_channel_attr_write_longlong(_this->rxLO, "frequency", round(freq));
         }
@@ -391,6 +438,7 @@ private:
         }
         if (_this->running) { SmGui::EndDisabled(); }
 
+        if (_this->running && _this->sweep.active()) { SmGui::BeginDisabled(); }
         SmGui::LeftLabel("Bandwidth");
         SmGui::FillWidth();
         if (SmGui::Combo(CONCAT("##_pluto_bw_", _this->name), &_this->bwId, _this->bandwidths.txt)) {
@@ -404,6 +452,7 @@ private:
                 config.release(true);
             }
         }
+        if (_this->running && _this->sweep.active()) { SmGui::EndDisabled(); }
 
         SmGui::LeftLabel("Gain Mode");
         SmGui::FillWidth();
@@ -433,6 +482,12 @@ private:
             }
         }
         if (_this->gmId) { SmGui::EndDisabled(); }
+
+        if (!core::args["server"].b() && _this->sweep.draw(_this->running)) {
+            config.acquire();
+            config.conf["sweep"] = _this->sweep.save();
+            config.release(true);
+        }
     }
 
     void setBandwidth(int bw) {
@@ -446,13 +501,14 @@ private:
 
     static void worker(void* ctx) {
         PlutoSDRSourceModule* _this = (PlutoSDRSourceModule*)ctx;
-        int blockSize = _this->samplerate / 200.0f;
+        int blockSize = _this->samplerate / 200;
 
         // Acquire channels
         iio_channel* rx0_i = iio_device_find_channel(_this->dev, "voltage0", 0);
         iio_channel* rx0_q = iio_device_find_channel(_this->dev, "voltage1", 0);
         if (!rx0_i || !rx0_q) {
             flog::error("Failed to acquire RX channels");
+            _this->sweep.fail("Failed to acquire RX channels. Stop and restart the source.");
             return;
         }
 
@@ -464,31 +520,73 @@ private:
         iio_buffer* rxbuf = iio_device_create_buffer(_this->dev, blockSize, false);
         if (!rxbuf) {
             flog::error("Could not create RX buffer");
+            _this->sweep.fail("Could not create RX buffer. Stop and restart the source.");
+            iio_channel_disable(rx0_i);
+            iio_channel_disable(rx0_q);
             return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(_this->rxBufferMutex);
+            _this->rxBuffer = rxbuf;
         }
 
         // Receive loop
-        while (true) {
+        while (_this->running) {
+            if (_this->sweep.needsTune()) {
+                const double center = _this->sweep.nextCenter();
+                const int result = iio_channel_attr_write_longlong(_this->rxLO, "frequency", llround(center));
+                if (result < 0) {
+                    flog::error("PlutoSDR sweep tune failed at {} Hz: {}", center, result);
+                    _this->sweep.fail("Frequency rejected by device. Check range, then stop and restart.");
+                    break;
+                }
+                // Two kernel buffers plus two conservative in-flight blocks.
+                _this->sweep.tuned(4);
+            }
             // Read samples
-            iio_buffer_refill(rxbuf);
+            const auto bytes = iio_buffer_refill(rxbuf);
+            if (bytes < 0) {
+                if (_this->running) {
+                    flog::error("PlutoSDR RX refill failed: {}", bytes);
+                    _this->sweep.fail("RX refill failed. Stop and restart the source.");
+                }
+                break;
+            }
 
             // Get buffer pointer
             int16_t* buf = (int16_t*)iio_buffer_first(rxbuf, rx0_i);
             if (!buf) { break; }
+            const auto stride = iio_buffer_step(rxbuf);
+            if (stride != 2 * sizeof(int16_t)) {
+                _this->sweep.fail("Unsupported RX sample layout. Stop and restart the source.");
+                flog::error("Unexpected PlutoSDR RX sample stride: {}", stride);
+                break;
+            }
+            const int samples = (std::min)(blockSize, static_cast<int>(bytes / stride));
+            if (samples <= 0) { continue; }
 
-            // Convert samples to CF32
-            volk_16i_s32f_convert_32f((float*)_this->stream.writeBuf, buf, 32768.0f, blockSize * 2);
+            if (_this->sweep.active()) {
+                _this->sweep.consume(buf, samples);
+                // Hopping IQ has no single center frequency. Keep the normal
+                // DSP graph alive, but do not demodulate or mislabel that IQ.
+                std::fill_n(_this->stream.writeBuf, samples, dsp::complex_t{0.0f, 0.0f});
+            }
+            else {
+                volk_16i_s32f_convert_32f((float*)_this->stream.writeBuf, buf, 32768.0f, samples * 2);
+            }
 
             // Send out the samples
-            if (!_this->stream.swap(blockSize)) { break; };
+            if (!_this->stream.swap(samples)) { break; }
         }
 
-        // Stop streaming
+        // Serialize destruction with stop(), which can cancel a pending refill.
+        {
+            std::lock_guard<std::mutex> lock(_this->rxBufferMutex);
+            _this->rxBuffer = NULL;
+            iio_buffer_destroy(rxbuf);
+        }
         iio_channel_disable(rx0_i);
         iio_channel_disable(rx0_q);
-
-        // Free buffer
-        iio_buffer_destroy(rxbuf);
     }
 
     std::string name;
@@ -501,12 +599,15 @@ private:
     iio_device* dev = NULL;
     iio_channel* rxLO = NULL;
     iio_channel* rxChan = NULL;
-    bool running = false;
+    std::atomic<bool> running{false};
+    std::mutex rxBufferMutex;
+    iio_buffer* rxBuffer = NULL;
+    sweep::Controller sweep;
 
     std::string devDesc = "";
     std::string uri = "";
 
-    double freq;
+    double freq = 100000000.0;
     int samplerate = 4000000;
     int bandwidth = 0;
     float gain = -1;

@@ -11,6 +11,8 @@
 #include <gui/smgui.h>
 #include <algorithm>
 #include <utils/optionlist.h>
+#include <atomic>
+#include "../../sweep/sweep_controller.h"
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -37,6 +39,10 @@ class BladeRFSourceModule : public ModuleManager::Instance {
 public:
     BladeRFSourceModule(std::string name) {
         this->name = name;
+
+        config.acquire();
+        if (config.conf.contains("sweep")) { sweep.load(config.conf["sweep"]); }
+        config.release();
 
         // Define clocks
         clocks.define("onboard", "On-Board", CLOCK_SELECT_ONBOARD);
@@ -377,11 +383,37 @@ private:
         _this->bufferSize *= 1024;
         if (_this->bufferSize < 1024) { _this->bufferSize = 1024; }
 
+        const double rfBandwidth = (_this->bwId == _this->bandwidths.size())
+            ? std::clamp<uint64_t>(_this->sampleRate, _this->bwRange->min, _this->bwRange->max)
+            : _this->bandwidths[_this->bwId];
+        if (!_this->sweep.begin(_this->sampleRate, rfBandwidth, _this->bufferSize, core::args["server"].b())) {
+            flog::error("Invalid bladeRF sweep settings");
+            bladerf_close(_this->openDev);
+            return;
+        }
         // Setup device parameters
         _this->setClockSource(_this->clocks[_this->clkId]);
-        bladerf_set_sample_rate(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), _this->sampleRate, NULL);
+        bladerf_sample_rate actualRate = 0;
+        bladerf_bandwidth actualBandwidth = 0;
+        const int rateResult = bladerf_set_sample_rate(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), _this->sampleRate, &actualRate);
         bladerf_set_frequency(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), _this->freq);
-        bladerf_set_bandwidth(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), (_this->bwId == _this->bandwidths.size()) ? std::clamp<uint64_t>(_this->sampleRate, _this->bwRange->min, _this->bwRange->max) : _this->bandwidths[_this->bwId], NULL);
+        const int bandwidthResult = bladerf_set_bandwidth(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), rfBandwidth, &actualBandwidth);
+        if (_this->sweep.active() && (rateResult != 0 || bandwidthResult != 0 ||
+            !_this->sweep.begin(actualRate, actualBandwidth, _this->bufferSize, false))) {
+            _this->sweep.fail("Could not configure the RX sample rate/bandwidth.");
+            bladerf_close(_this->openDev);
+            return;
+        }
+        if (_this->sweep.active()) {
+            const bladerf_range* range = nullptr;
+            ret = bladerf_get_frequency_range(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), &range);
+            if (ret != 0 || !range || _this->sweep.plan().centers.front() < range->min * range->scale ||
+                _this->sweep.plan().centers.back() > range->max * range->scale) {
+                _this->sweep.fail("Sweep centers exceed this device's frequency range.");
+                bladerf_close(_this->openDev);
+                return;
+            }
+        }
         bladerf_set_gain_mode(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), _this->gainModes[_this->gainMode].mode);
 
         if (_this->selectedBladeType == BLADERF_TYPE_V2) {
@@ -393,14 +425,27 @@ private:
             bladerf_set_gain(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), _this->overallGain);
         }
 
-        _this->streamingEnabled = true;
-
         // Setup synchronous transfer
-        bladerf_sync_config(_this->openDev, BLADERF_RX_X1, BLADERF_FORMAT_SC16_Q11, 16, _this->bufferSize, 8, 3500);
+        ret = bladerf_sync_config(_this->openDev, BLADERF_RX_X1, BLADERF_FORMAT_SC16_Q11,
+                                 _this->sweep.active() ? 4 : 16, _this->bufferSize,
+                                 _this->sweep.active() ? 2 : 8, 3500);
+        if (ret != 0) {
+            flog::error("Could not configure bladeRF RX: {}", bladerf_strerror(ret));
+            _this->sweep.fail("Could not configure RX streaming.");
+            bladerf_close(_this->openDev);
+            return;
+        }
 
         // Enable streaming
-        bladerf_enable_module(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), true);
+        ret = bladerf_enable_module(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), true);
+        if (ret != 0) {
+            flog::error("Could not enable bladeRF RX: {}", bladerf_strerror(ret));
+            _this->sweep.fail("Could not enable RX streaming.");
+            bladerf_close(_this->openDev);
+            return;
+        }
 
+        _this->streamingEnabled = true;
         _this->running = true;
         _this->workerThread = std::thread(&BladeRFSourceModule::worker, _this);
 
@@ -432,7 +477,7 @@ private:
     static void tune(double freq, void* ctx) {
         BladeRFSourceModule* _this = (BladeRFSourceModule*)ctx;
         _this->freq = freq;
-        if (_this->running) {
+        if (_this->running && !_this->sweep.active()) {
             bladerf_set_frequency(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), _this->freq);
         }
         flog::info("BladeRFSourceModule '{0}': Tune: {1}!", _this->name, freq);
@@ -488,6 +533,7 @@ private:
 
         if (_this->running) { SmGui::EndDisabled(); }
 
+        if (_this->running && _this->sweep.active()) { SmGui::BeginDisabled(); }
         SmGui::LeftLabel("Bandwidth");
         SmGui::FillWidth();
         if (SmGui::Combo(CONCAT("##_balderf_bw_sel_", _this->name), &_this->bwId, _this->bandwidthsTxt.c_str())) {
@@ -513,6 +559,8 @@ private:
                 config.release(true);
             }
         }
+
+        if (_this->running && _this->sweep.active()) { SmGui::EndDisabled(); }
 
         // General config BS
         SmGui::LeftLabel("Gain control mode");
@@ -563,6 +611,12 @@ private:
                 config.release(true);
             }
         }
+
+        if (!core::args["server"].b() && _this->sweep.draw(_this->running)) {
+            config.acquire();
+            config.conf["sweep"] = _this->sweep.save();
+            config.release(true);
+        }
     }
 
     void setClockSource(bladerf_clock_select clk) {
@@ -576,15 +630,37 @@ private:
 
     void worker() {
         int16_t* buffer = new int16_t[bufferSize * 2];
-        bladerf_metadata meta;
+        bladerf_metadata meta{};
 
         while (streamingEnabled) {
+            if (sweep.needsTune()) {
+                const double center = sweep.nextCenter();
+                const int ret = bladerf_set_frequency(openDev, BLADERF_CHANNEL_RX(chanId),
+                                                     static_cast<bladerf_frequency>(std::llround(center)));
+                if (ret != 0) {
+                    flog::error("bladeRF sweep tune failed at {} Hz: {}", center, bladerf_strerror(ret));
+                    sweep.fail("Frequency rejected by device. Check range, then stop and restart.");
+                    break;
+                }
+                // Four sync buffers plus two transfers may contain pre-tune IQ.
+                sweep.tuned(6);
+            }
             // Receive from the stream and break on error
             int ret = bladerf_sync_rx(openDev, buffer, bufferSize, &meta, 3500);
-            if (ret != 0) { break; }
+            if (ret != 0) {
+                flog::error("bladeRF RX failed: {}", bladerf_strerror(ret));
+                sweep.fail("RX failed. Stop and restart the source.");
+                break;
+            }
 
             // Convert to complex float and swap buffers
-            volk_16i_s32f_convert_32f((float*)stream.writeBuf, buffer, 32768.0f, bufferSize * 2);
+            if (sweep.active()) {
+                sweep.consume(buffer, bufferSize);
+                std::fill_n(stream.writeBuf, bufferSize, dsp::complex_t{0.0f, 0.0f});
+            }
+            else {
+                volk_16i_s32f_convert_32f((float*)stream.writeBuf, buffer, 32768.0f, bufferSize * 2);
+            }
             if (!stream.swap(bufferSize)) { break; }
         }
 
@@ -598,14 +674,15 @@ private:
     double sampleRate;
     SourceManager::SourceHandler handler;
     bool running = false;
-    double freq;
+    double freq = 100000000.0;
     int devId = 0;
     int srId = 0;
     int bwId = 0;
     int clkId = 0;
     int chanId = 0;
     int gainMode = 0;
-    bool streamingEnabled = false;
+    std::atomic<bool> streamingEnabled{false};
+    sweep::Controller sweep;
     bool biasT = false;
 
     int channelCount;
